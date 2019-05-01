@@ -20,6 +20,11 @@ var upstreamAddr = flag.String(
 )
 var dumpDir = flag.String("dir", "./", "directory to dump traffic")
 
+const suffixReqHeaders = ".request_headers"
+const suffixReqBody = ".request_body"
+const suffixRespHeaders = ".response_headers"
+const suffixRespBody = ".response_body"
+
 var dialer = &net.Dialer{
 	Timeout:   30 * time.Second,
 	KeepAlive: 30 * time.Second,
@@ -48,7 +53,24 @@ var httpClient = http.Client{
 
 func proxy(w http.ResponseWriter, r *http.Request) {
 	url := "http://" + r.Host + r.RequestURI
-	cr, err := http.NewRequest(r.Method, url, r.Body)
+
+	fNamePrefix, err := fname()
+	if err != nil {
+		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	reqBodyFile, err := os.Create(fNamePrefix + suffixReqBody)
+	if err != nil {
+		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer closeLogError(reqBodyFile)
+	bodyReader := io.TeeReader(r.Body, reqBodyFile)
+
+	cr, err := http.NewRequest(r.Method, url, bodyReader)
 	if err != nil {
 		log.Print(err)
 		w.WriteHeader(http.StatusBadGateway)
@@ -58,6 +80,35 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 
 	cr = cr.WithContext(r.Context())
 
+	reqHeadersFile, err := os.Create(fNamePrefix + suffixReqHeaders)
+	if err != nil {
+		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer closeLogError(reqHeadersFile)
+
+	_, err = fmt.Fprintf(
+		reqHeadersFile, "%v %v %v\n", r.Method, r.RequestURI, r.Proto,
+	)
+	if err != nil {
+		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	for header, values := range r.Header {
+		for _, value := range values {
+			cr.Header.Add(header, value)
+			_, err = fmt.Fprintf(reqHeadersFile, "%v: %v\n", header, value)
+			if err != nil {
+				log.Print(err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+
 	resp, err := httpClient.Do(cr)
 	if err != nil {
 		log.Print(err)
@@ -66,26 +117,96 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer closeLogError(resp.Body)
 
+	if err = processResponseHeaders(fNamePrefix, resp, w); err != nil {
+		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if err = processResponseBody(fNamePrefix, resp.Body, w); err != nil {
+		log.Print(err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("%v %v %v %v", r.Host, resp.StatusCode, r.URL, fNamePrefix)
+}
+
+func processResponseHeaders(
+	dumpFilePrefix string,
+	resp *http.Response,
+	w http.ResponseWriter,
+) error {
+	respHeadersFile, err := os.Create(dumpFilePrefix + suffixRespHeaders)
+	if err != nil {
+		return err
+	}
+	defer closeLogError(respHeadersFile)
+
+	_, err = fmt.Fprintf(respHeadersFile, "%v\n", resp.Status)
+	if err != nil {
+		return err
+	}
+
 	for header, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(header, value)
+			_, err = fmt.Fprintf(respHeadersFile, "%v: %v\n", header, value)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
 	w.WriteHeader(resp.StatusCode)
 
-	bodySize, err := io.Copy(w, resp.Body)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	fNamePrefix, err := fname()
-	if err != nil {
-		log.Print(err)
-	}
-	_ = fNamePrefix
+	return nil
+}
 
-	log.Printf("%v %v %v %v %v", r.Host, resp.StatusCode, bodySize, r.URL, fNamePrefix)
+func processResponseBody(
+	dumpFilePrefix string,
+	respBody io.Reader,
+	w io.Writer,
+) error {
+	respBodyFile, err := os.Create(dumpFilePrefix + suffixRespBody)
+	if err != nil {
+		return err
+	}
+	defer closeLogError(respBodyFile)
+
+	var buf = make([]byte, 16384)
+	for {
+		brk := false
+		n, err := respBody.Read(buf)
+		switch err {
+		case io.EOF:
+			brk = true
+		case nil:
+		default:
+			return err
+		}
+
+		n2, err := respBodyFile.Write(buf[:n])
+		if err != nil {
+			return err
+		}
+		if n2 != n {
+			panic("[assertion] n2 != n")
+		}
+
+		n3, err := w.Write(buf[:n])
+		if err != nil {
+			return err
+		}
+		if n3 != n {
+			panic("[assertion] n3 != n")
+		}
+		if brk {
+			break
+		}
+	}
+
+	return nil
 }
 
 func fname() (string, error) {
