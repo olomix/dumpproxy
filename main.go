@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -65,7 +66,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		log.Printf(
 			"%v %v %v %v %v",
 			r.Host,
-			r.RemoteAddr,
+			extractAddr(r.RemoteAddr),
 			statusCode,
 			r.URL,
 			fNamePrefix,
@@ -261,6 +262,14 @@ func closeLogError(closer io.Closer) {
 	if err != nil {
 		log.Print(err)
 	}
+}
+
+func extractAddr(addr string) string {
+	idx := strings.IndexRune(addr, ':')
+	if idx > 6 {
+		return addr[:idx]
+	}
+	return addr
 }
 
 func main() {
