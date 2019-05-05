@@ -54,36 +54,60 @@ var httpClient = http.Client{
 func proxy(w http.ResponseWriter, r *http.Request) {
 	url := "http://" + r.Host + r.RequestURI
 
-	fNamePrefix, err := fname()
+	var (
+		err         error
+		fNamePrefix string
+		statusCode  = 0
+	)
+
+	// Log request
+	defer func() {
+		log.Printf(
+			"%v %v %v %v %v",
+			r.Host,
+			r.RemoteAddr,
+			statusCode,
+			r.URL,
+			fNamePrefix,
+		)
+		if err != nil {
+			log.Print(err)
+		}
+	}()
+
+	fNamePrefix, err = fname()
 	if err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusInternalServerError)
+		statusCode = http.StatusInternalServerError
+		w.WriteHeader(statusCode)
 		return
 	}
 
-	reqBodyFile, err := os.Create(fNamePrefix + suffixReqBody)
+	var reqBodyFile *os.File
+	reqBodyFile, err = os.Create(fNamePrefix + suffixReqBody)
 	if err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusInternalServerError)
+		statusCode = http.StatusInternalServerError
+		w.WriteHeader(statusCode)
 		return
 	}
 	defer closeLogError(reqBodyFile)
 	bodyReader := io.TeeReader(r.Body, reqBodyFile)
 
-	cr, err := http.NewRequest(r.Method, url, bodyReader)
+	var cr *http.Request
+	cr, err = http.NewRequest(r.Method, url, bodyReader)
 	if err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusBadGateway)
+		statusCode = http.StatusBadGateway
+		w.WriteHeader(statusCode)
 		return
 	}
 	defer closeLogError(cr.Body)
 
 	cr = cr.WithContext(r.Context())
 
-	reqHeadersFile, err := os.Create(fNamePrefix + suffixReqHeaders)
+	var reqHeadersFile *os.File
+	reqHeadersFile, err = os.Create(fNamePrefix + suffixReqHeaders)
 	if err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusInternalServerError)
+		statusCode = http.StatusInternalServerError
+		w.WriteHeader(statusCode)
 		return
 	}
 	defer closeLogError(reqHeadersFile)
@@ -92,8 +116,8 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		reqHeadersFile, "%v %v %v\n", r.Method, r.RequestURI, r.Proto,
 	)
 	if err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusInternalServerError)
+		statusCode = http.StatusInternalServerError
+		w.WriteHeader(statusCode)
 		return
 	}
 
@@ -102,50 +126,50 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 			cr.Header.Add(header, value)
 			_, err = fmt.Fprintf(reqHeadersFile, "%v: %v\n", header, value)
 			if err != nil {
-				log.Print(err)
-				w.WriteHeader(http.StatusInternalServerError)
+				statusCode = http.StatusInternalServerError
+				w.WriteHeader(statusCode)
 				return
 			}
 		}
 	}
 
-	resp, err := httpClient.Do(cr)
+	var resp *http.Response
+	resp, err = httpClient.Do(cr)
 	if err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusBadGateway)
+		statusCode = http.StatusBadGateway
+		w.WriteHeader(statusCode)
 		return
 	}
 	defer closeLogError(resp.Body)
 
-	if err = processResponseHeaders(fNamePrefix, resp, w); err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusInternalServerError)
+	statusCode, err = processResponseHeaders(fNamePrefix, resp, w)
+	if err != nil {
+		statusCode = http.StatusInternalServerError
+		w.WriteHeader(statusCode)
 		return
 	}
 
 	if err = processResponseBody(fNamePrefix, resp.Body, w); err != nil {
-		log.Print(err)
-		w.WriteHeader(http.StatusInternalServerError)
+		statusCode = http.StatusInternalServerError
+		w.WriteHeader(statusCode)
 		return
 	}
-
-	log.Printf("%v %v %v %v", r.Host, resp.StatusCode, r.URL, fNamePrefix)
 }
 
 func processResponseHeaders(
 	dumpFilePrefix string,
 	resp *http.Response,
 	w http.ResponseWriter,
-) error {
+) (int, error) {
 	respHeadersFile, err := os.Create(dumpFilePrefix + suffixRespHeaders)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer closeLogError(respHeadersFile)
 
 	_, err = fmt.Fprintf(respHeadersFile, "%v\n", resp.Status)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	for header, values := range resp.Header {
@@ -153,14 +177,14 @@ func processResponseHeaders(
 			w.Header().Add(header, value)
 			_, err = fmt.Fprintf(respHeadersFile, "%v: %v\n", header, value)
 			if err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
 
 	w.WriteHeader(resp.StatusCode)
 
-	return nil
+	return resp.StatusCode, nil
 }
 
 func processResponseBody(
